@@ -1,0 +1,8 @@
+Flask
+flask-cors
+torch
+Pillow
+torchvision
+python-dotenv
+werkzeug
+groq

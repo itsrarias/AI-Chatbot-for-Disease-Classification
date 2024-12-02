@@ -1,1 +1,11 @@
-venv/
+venv_name/
+node_modules
+.env
+backend/disease_detection_modelOG.pth
+backend/best_model_2.pth
+backend/static
+backend/static/diagrams
+backend/static/uploads
+backend/newModel.pth
+backend/single_Model.pth
+backend/*.pth

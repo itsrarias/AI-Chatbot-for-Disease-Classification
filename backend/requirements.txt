@@ -9,3 +9,7 @@ werkzeug
 groq
 flask-caching
 redis
+flask-sqlalchemy
+flask-login
+flask-migrate
+beautifulsoup4

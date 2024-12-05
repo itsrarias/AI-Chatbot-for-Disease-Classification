@@ -1,11 +1,31 @@
-venv_name/
-node_modules
+# Python Virtual Environment
+backend/venv_name/
+backend/venv/
+
+# Node.js Dependencies
+node_modules/
+frontend/node_modules/
+
+# Environment Variables
 .env
-backend/disease_detection_modelOG.pth
-backend/best_model_2.pth
-backend/static
-backend/static/diagrams
-backend/static/uploads
-backend/newModel.pth
-backend/single_Model.pth
+
+# Model Files
 backend/*.pth
+
+# Static Files
+backend/static/
+backend/static/diagrams/
+backend/static/uploads/
+
+# Flask Instance Folder (Stores Local Data)
+backend/instance/
+
+# Database Migrations
+backend/migrations/
+
+# OS Generated Files
+.DS_Store
+Thumbs.db
+
+# Log Files
+*.log

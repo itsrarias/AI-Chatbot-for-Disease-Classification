@@ -3,6 +3,7 @@ import torch
 from PIL import Image
 from torchvision import transforms
 import os
+import logging
 import torch.nn as nn
 import torchvision.models as models
 from groq import Groq
@@ -11,36 +12,96 @@ from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from flask_caching import Cache
 from hashlib import md5
-from flask_session import Session
-from redis import Redis
+from bs4 import BeautifulSoup
+from flask import send_from_directory
+
+from flask_sqlalchemy import SQLAlchemy
+from flask_migrate import Migrate
+from sqlalchemy import inspect
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+from werkzeug.security import generate_password_hash, check_password_hash
+import json
+
 
 # Load environment variables from the .env file
 load_dotenv()
 
 # Initialize Flask app
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
-app.secret_key = os.getenv('FLASK_SECRET_KEY')
+CORS(app, supports_credentials=True, resources={r"/*": {"origins": "http://localhost:3000"}})
+app.secret_key = os.getenv('FLASK_SECRET_KEY')  # Replace with a secure key
 app.config['UPLOAD_FOLDER'] = 'static/uploads/'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///app.db'  # Adjust your database URI as needed
+db = SQLAlchemy(app)
+migrate = Migrate(app, db)
 
-# Initialize the cache
+login_manager = LoginManager(app)
 cache = Cache(config={'CACHE_TYPE': 'simple'})  # Simple in-memory cache
 cache.init_app(app)
 
-# Configure session to use Redis
-app.config['SESSION_TYPE'] = 'redis'
-app.config['SESSION_PERMANENT'] = False  # Set to True if you want sessions to persist between server restarts
-app.config['SESSION_USE_SIGNER'] = True  # Sign the session to prevent tampering
-app.config['SESSION_KEY_PREFIX'] = 'your_app_session:'  # Prefix for Redis keys
-app.config['SESSION_REDIS'] = Redis(host='localhost', port=6379, db=0)
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
 
-from flask_cors import CORS
+@app.route('/uploads/<filename>')
+def uploaded_file(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
-CORS(app, supports_credentials=True, resources={r"/*": {"origins": "http://localhost:3000"}})
+@app.route('/diagrams/<filename>')
+def diagram_file(filename):
+    return send_from_directory('diagrams/', filename)
 
-# Initialize the session extension
-Session(app)
 
+
+# Define the User, Chat, and Message models
+class User(db.Model, UserMixin):
+    __tablename__ = 'user'  # Explicitly define the table name
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(150), nullable=False, unique=True)
+    password_hash = db.Column(db.String(128))
+    chats = db.relationship('Chat', backref='user', lazy=True)
+
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+  
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+class Chat(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(150), nullable=False, default='New Chat')
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    messages = db.relationship('Message', backref='chat', lazy=True, cascade='all, delete-orphan')
+
+
+class Message(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    role = db.Column(db.String(10), nullable=False)
+    content = db.Column(db.Text, nullable=False)
+    chat_id = db.Column(db.Integer, db.ForeignKey('chat.id'), nullable=False)
+    # The backref 'chat' in Chat model already provides access to the Chat object
+    images = db.Column(db.Text)  # Store image URLs as JSON string
+    diagrams = db.Column(db.Text)  # Store diagram URLs as JSON string
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+# Error handler for 404 Not Found
+@app.errorhandler(404)
+def not_found_error(error):
+    return jsonify({'error': 'Resource not found.'}), 404
+
+# Error handler for 403 Forbidden
+@app.errorhandler(403)
+def forbidden_error(error):
+    return jsonify({'error': 'Unauthorized access.'}), 403
+
+# Error handler for 500 Internal Server Error
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({'error': 'An internal server error occurred.'}), 500
+
+# Function to check if a prompt is health-related
 def is_health_related(prompt):
     health_keywords = [
         'health', 'medicine', 'medical', 'doctor', 'disease', 'symptom',
@@ -83,17 +144,173 @@ def is_health_related(prompt):
         'orthotic', 'hearing aid', 'eyeglasses', 'contact lenses', 'vision correction',
         'LASIK', 'refractive surgery', 'eye exam', 'fundus', 'retina', 'cornea',
         'pupil', 'iris', 'lens', 'optic nerve', 'sclera', 'tear duct', 'vitreous humor', 'kids', 'adults',
-        'elderly', 'infants', 'toddlers', 'ocular', 'diagnosis', 'prognosis', 'care', 'children', 'child', 'patient'
+        'elderly', 'infants', 'toddlers', 'ocular', 'diagnosis', 'prognosis', 'care', 'children', 'child', 'patient',
+        'causes', 'genetic', 'hereditary', 'natural', 'carcinogens', 'food', 'sugar', 'age'
         # Add any more relevant keywords as necessary
     ]
     prompt_lower = prompt.lower()
     return any(keyword in prompt_lower for keyword in health_keywords)
 
-@app.route('/')
-def index():
-    # Example of setting a value in the session
-    session['key'] = 'value'
-    return 'Session set!'
+# Route for user registration
+@app.route('/register', methods=['POST'])
+def register():
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No input data provided.'}), 400
+
+        username = data.get('username')
+        password = data.get('password')
+
+        if not username or not password:
+            return jsonify({'error': 'Username and password are required.'}), 400
+
+        if User.query.filter_by(username=username).first():
+            return jsonify({'error': 'Username already exists.'}), 400
+
+        new_user = User(username=username)
+        new_user.set_password(password)
+        db.session.add(new_user)
+        db.session.commit()
+
+        login_user(new_user)
+
+        return jsonify({'message': 'Registration successful.'}), 201
+
+    except Exception as e:
+        logging.exception("Exception during registration")
+        return jsonify({'error': 'Internal server error.'}), 500
+
+# Route for user login
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
+
+    user = User.query.filter_by(username=username).first()
+    if user and user.check_password(password):
+        login_user(user)
+        return jsonify({'message': 'Login successful.'}), 200
+    else:
+        return jsonify({'error': 'Invalid credentials.'}), 401
+    
+@login_manager.unauthorized_handler
+def unauthorized_callback():
+    # Return a JSON response with a 401 Unauthorized status
+    return jsonify({'error': 'Unauthorized'}), 401
+
+# Route for user logout
+@app.route('/logout', methods=['POST'])
+@login_required
+def logout():
+    logout_user()
+    return jsonify({'message': 'Logged out successfully.'}), 200
+
+# Route to create a new chat
+@app.route('/api/chats', methods=['POST'])
+@login_required
+def create_chat():
+    try:
+        # Parse incoming JSON
+        data = request.get_json()
+        if not data or 'name' not in data:
+            return jsonify({'error': 'Chat name is required.'}), 400
+
+        chat_name = data.get('name', 'New Chat')
+
+        # Create a new chat
+        new_chat = Chat(name=chat_name, user_id=current_user.id)
+        db.session.add(new_chat)
+        db.session.commit()
+
+        # Respond with the new chat details
+        return jsonify({'chat_id': new_chat.id, 'name': new_chat.name}), 201
+    except Exception as e:
+        # Handle unexpected errors
+        return jsonify({'error': 'Failed to create chat.', 'message': str(e)}), 500
+
+
+# Route to get all chats for the current user
+@app.route('/api/chats', methods=['GET'])
+@login_required
+def get_chats():
+    try:
+        chats = Chat.query.filter_by(user_id=current_user.id).all()
+        chat_list = [{'id': chat.id, 'name': chat.name} for chat in chats]
+        return jsonify(chat_list), 200
+    except Exception as e:
+        app.logger.error(f"Error in /api/chats: {str(e)}")
+        return jsonify({'error': 'Failed to fetch chats'}), 500
+
+@app.route('/api/chats/<int:chat_id>/messages', methods=['GET'])
+@login_required
+def get_chat_messages(chat_id):
+    chat = Chat.query.get_or_404(chat_id)
+
+    if chat.user_id != current_user.id:
+        return jsonify({'error': 'Unauthorized access.'}), 403
+
+    messages = Message.query.filter_by(chat_id=chat_id).all()
+    messages_data = []
+
+    for message in messages:
+        message_data = {
+            'id': message.id,
+            'role': message.role,
+            'content': message.content,
+            'images': json.loads(message.images) if message.images else [],
+            'diagrams': json.loads(message.diagrams) if message.diagrams else [],
+        }
+
+        if message.images:
+            message_data['images'] = json.loads(message.images)
+        if message.diagrams:
+            message_data['diagrams'] = json.loads(message.diagrams)
+
+        messages_data.append(message_data)
+
+    return jsonify(messages_data), 200
+
+# Route to delete a chat
+@app.route('/api/chats/<int:chat_id>', methods=['DELETE'])
+@login_required
+def delete_chat(chat_id):
+    chat = Chat.query.get_or_404(chat_id)
+
+    if chat.user_id != current_user.id:
+        return jsonify({'error': 'Unauthorized access.'}), 403
+
+    db.session.delete(chat)
+    db.session.commit()
+
+    return jsonify({'message': 'Chat deleted successfully.'}), 200
+
+# Load and configure models, transformations, and mappings as before
+# (FundusDetector, DiseaseSpecificModel, class_to_disease, disease_treatment, disease_diagram)
+
+# Define the model
+class FundusDetector(nn.Module):
+    def __init__(self):
+        super(FundusDetector, self).__init__()
+        # Load a pretrained ResNet50 model
+        self.model = models.resnet50(pretrained=True)
+        # Replace the last fully connected layer
+        num_features = self.model.fc.in_features
+        self.model.fc = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(num_features, 2)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+# Load and configure the fundus detector model
+fundus_detector_model_path = 'best_fundus_detector.pth'  # Path to the fundus detector model
+fundus_detector = FundusDetector()
+fundus_detector.load_state_dict(torch.load(fundus_detector_model_path, map_location=torch.device('cpu')))
+fundus_detector.eval()
+
 
 # Define your image classification models
 class DiseaseSpecificModel(nn.Module):
@@ -106,11 +323,11 @@ class DiseaseSpecificModel(nn.Module):
     def forward(self, x):
         return self.model(x)
 
-# Load and configure the two-image classification model
-two_image_model_path = 'newModel.pth'  # Path to the two-image model
-two_image_model = DiseaseSpecificModel(num_classes=8)
-two_image_model.load_state_dict(torch.load(two_image_model_path, map_location=torch.device('cpu')))
-two_image_model.eval()
+# Load and configure the dual-image classification model (processes single images)
+dual_image_model_path = 'newDualModel.pth'  # Path to the new dual-image model
+dual_image_model = DiseaseSpecificModel(num_classes=8)
+dual_image_model.load_state_dict(torch.load(dual_image_model_path, map_location=torch.device('cpu')))
+dual_image_model.eval()
 
 # Load and configure the single-image classification model
 single_image_model_path = 'single_Model.pth'  # Path to the single-image model
@@ -159,16 +376,19 @@ disease_diagram = {
     'Other Diseases/Abnormalities': 'Other_Diseases.jpg'
 }
 
+
 # Initialize Groq client
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-# Function to get the LLM response using Groq
-def get_llm_response(disease_list, treatment_list, chat_history=None, is_image_upload=False):
+# Updated function to get the LLM response using Groq
+# Updated function to get the LLM response using Groq
+def get_llm_response(left_diseases=None, right_diseases=None, chat_history=None, is_image_upload=False):
     # Simplified system message
     system_message = (
-        "You are a helpful and knowledgeable medical assistant specialized in ophthalmology."
-        "Provide factual answers from a medical perspective."
-        "Ensure the information is accurate and easy to understand."
+        "You are a helpful and knowledgeable medical assistant specialized in ophthalmology. "
+        "Provide factual answers from a medical perspective. "
+        "Ensure the information is accurate and easy to understand. "
+        # "Present the information in plain text without any HTML or markup. "
         "You must not answer queries unrelated to health, medicine, or overall well-being."
     )
 
@@ -181,25 +401,47 @@ def get_llm_response(disease_list, treatment_list, chat_history=None, is_image_u
 
     # Generate the prompt based on the diagnosis
     if is_image_upload:
-        if disease_list:
-            if disease_list == ['Normal']:
-                # Handle case where 'Normal' is predicted
+        # Determine which eyes have diagnoses
+        prompt_parts = []
+        eye_descriptions = []
+
+        if left_diseases is not None:
+            left_diseases_str = ', '.join(left_diseases) if left_diseases else 'No detectable diseases'
+            prompt_parts.append(f"- Left Eye: {left_diseases_str}")
+            if left_diseases == ['Normal']:
+                eye_descriptions.append("left eye")
+
+        if right_diseases is not None:
+            right_diseases_str = ', '.join(right_diseases) if right_diseases else 'No detectable diseases'
+            prompt_parts.append(f"- Right Eye: {right_diseases_str}")
+            if right_diseases == ['Normal']:
+                eye_descriptions.append("right eye")
+
+        # Check if all provided eyes are normal
+        if (
+            (left_diseases == ['Normal'] if left_diseases is not None else True) and
+            (right_diseases == ['Normal'] if right_diseases is not None else True)
+        ):
+            if eye_descriptions:
+                eye_str = " and ".join(eye_descriptions)
                 prompt = (
-                    "The patient's eye images appear normal with no detectable signs of ocular diseases. "
+                    f"The patient's {'eyes are' if len(eye_descriptions) > 1 else 'eye is'} normal with no detectable signs of ocular diseases "
+                    f"in the {eye_str}. "
                     "Provide guidelines for maintaining optimal eye health, including lifestyle recommendations."
                 )
             else:
-                diseases = ', '.join(disease_list)
+                # No eyes provided or no diagnoses, default message
                 prompt = (
-                    f"A patient is diagnosed with {diseases}. "
-                    "Provide a detailed medical report that includes recommended treatment options, lifestyle changes, possible outcomes, and future prognosis."
+                    "No detectable diseases were found in the uploaded eye image. "
+                    "Provide guidelines for maintaining optimal eye health, including lifestyle recommendations."
                 )
         else:
-            # Handle case where neither 'Normal' nor diseases are predicted
             prompt = (
-                "The patient shows no detectable signs of ocular diseases. "
-                "Provide guidelines for maintaining optimal eye health, including lifestyle recommendations."
+                "A patient is diagnosed with the following condition(s):\n"
+                f"{chr(10).join(prompt_parts)}\n"
+                "Provide a detailed medical report that includes recommended treatment options, lifestyle changes, possible outcomes, and future prognosis for each condition."
             )
+
         messages.append({"role": "user", "content": prompt})
     elif chat_history:
         # If not an image upload, rely on the existing chat history
@@ -217,178 +459,254 @@ def get_llm_response(disease_list, treatment_list, chat_history=None, is_image_u
         )
         response_text = response.choices[0].message.content
         print(f"LLM Response: {response_text}")  # For debugging
+
+        # Remove HTML tags from the response using BeautifulSoup
+        soup = BeautifulSoup(response_text, 'html.parser')
+        clean_response_text = soup.get_text()
+        print(f"Cleaned LLM Response: {clean_response_text}")  # For debugging
+
     except Exception as e:
         print(f"Error during text generation: {e}")
         return "Error during text generation."
 
-    return response_text
+    return clean_response_text
 
-# Custom function to generate a cache key based on the request body (prompt)
-def make_cache_key():
-    if request.json and 'prompt' in request.json:
-        prompt = request.json['prompt'].strip().lower()  # Normalize prompt
-        return md5(prompt.encode('utf-8')).hexdigest()
-    return None
 
-@app.route('/api/chat', methods=['POST'])
-@cache.cached(timeout=300, key_prefix=make_cache_key)  # Cache using a custom key based on the prompt
-def handle_chat():
-    if request.json and 'prompt' in request.json:
-        user_prompt = request.json['prompt']
+# Route to add a message and get the LLM response
+@app.route('/api/chats/<int:chat_id>/messages', methods=['POST'])
+@login_required
+def add_message(chat_id):
+    chat = Chat.query.get_or_404(chat_id)
+    if chat.user_id != current_user.id:
+        return jsonify({'error': 'Unauthorized.'}), 403
 
+    data = request.get_json()
+    user_prompt = data.get('prompt')
+
+    if user_prompt:
         # Check if the prompt is health-related
         if not is_health_related(user_prompt):
             return jsonify({"response": "I can only assist with medical and health-related inquiries."}), 200
 
-        session['chat_history'] = session.get('chat_history', [])
-        session['chat_history'].append({'role': 'user', 'content': user_prompt})
+        # Append the user message to the chat history in the database
+        new_message = Message(role='user', content=user_prompt, chat_id=chat.id)
+        db.session.add(new_message)
+        db.session.commit()
 
-        # Get the LLM response with chat history
-        llm_response = get_llm_response([], [], chat_history=session['chat_history'])
+        # Retrieve the last 5 messages for context
+        messages = Message.query.filter_by(chat_id=chat.id).order_by(Message.id).all()
+        chat_history = [{'role': msg.role, 'content': msg.content} for msg in messages][-5:]
 
-        # Append the LLM response to the chat history with role 'assistant'
-        session['chat_history'].append({'role': 'assistant', 'content': llm_response})
+        # Get the LLM response
+        llm_response = get_llm_response(chat_history=chat_history)
 
-        return jsonify({"response": llm_response, "chat_history": session['chat_history']})
-    
+        # Append the assistant's response to the chat history in the database
+        assistant_message = Message(role='assistant', content=llm_response, chat_id=chat.id)
+        db.session.add(assistant_message)
+        db.session.commit()
+
+        return jsonify({"response": llm_response, "chat_history": chat_history})
+
     return jsonify({"error": "Invalid input"}), 400
 
+# Route to get messages from a chat
+@app.route('/api/chats/<int:chat_id>/messages', methods=['GET'])
+@login_required
+def get_messages(chat_id):
+    chat = Chat.query.get_or_404(chat_id)
+    if chat.user_id != current_user.id:
+        return jsonify({'error': 'Unauthorized.'}), 403
+
+    messages = Message.query.filter_by(chat_id=chat.id).all()
+    message_list = [{'role': msg.role, 'content': msg.content} for msg in messages]
+    return jsonify(message_list), 200
+
 # API endpoint for handling file upload
-@app.route('/api/upload', methods=['POST'])
-def handle_upload():
+@app.route('/api/chats/<int:chat_id>/upload', methods=['POST'])
+@login_required
+def handle_upload(chat_id):
+    chat = Chat.query.get_or_404(chat_id)
+    if chat.user_id != current_user.id:
+        return jsonify({'error': 'Unauthorized.'}), 403
+
     # Extract the user message if available
-    message = request.form.get('message', '')
+    message_text = request.form.get('message', '')
 
     # Check if the message is health-related if present
-    if message and not is_health_related(message):
+    if message_text and not is_health_related(message_text):
         return jsonify({"response": "I can only assist with medical and health-related inquiries."}), 200
 
     # Get the list of uploaded files
     uploaded_files = request.files.getlist('file')
-    total_files = len(uploaded_files)
+    eye_labels = request.form.getlist('eye_labels')
 
-    # Count the number of images uploaded
-    num_images = len(request.files)
+    # Validate number of images and eye labels
+    if len(uploaded_files) != len(eye_labels):
+        return jsonify({"error": "The number of images does not match the number of eye labels."}), 400
 
-    # Check if more than 2 images are uploaded
-    if num_images > 2:
-        return jsonify({"error": "Please upload no more than two images (left eye and right eye)."}), 400
+    # Validate eye labels
+    valid_eye_labels = ['left', 'right']
+    for label in eye_labels:
+        if label.lower() not in valid_eye_labels:
+            return jsonify({"error": f"Invalid eye label '{label}'. Accepted values are 'left' or 'right'."}), 400
 
-    if num_images == 0:
+    if len(uploaded_files) == 0:
         return jsonify({"error": "Please upload at least one eye image."}), 400
 
-    # Handle file uploads
-    left_file = request.files.get('left_eye', None)
-    right_file = request.files.get('right_eye', None)
+    if len(uploaded_files) > 2:
+        return jsonify({"error": "Please upload no more than two images (left eye and right eye)."}), 400
 
-    # Ensure that only 'left_eye' and 'right_eye' are accepted
-    accepted_filenames = ['left_eye', 'right_eye']
-    for filename in request.files:
-        if filename not in accepted_filenames:
-            return jsonify({"error": f"Invalid file field '{filename}'. Only 'left_eye' and 'right_eye' are accepted."}), 400
+    # Process uploaded files and eye labels
+    images = {}
+    image_urls = []
+    for file, eye_label in zip(uploaded_files, eye_labels):
+        filename = secure_filename(file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
 
-    if left_file:
-        left_filename = secure_filename(left_file.filename)
-        left_filepath = os.path.join(app.config['UPLOAD_FOLDER'], left_filename)
-        left_file.save(left_filepath)
-    else:
-        left_filepath = None
+        # Generate image URL and add to list
+        image_url = url_for('uploaded_file', filename=filename, _external=True)
+        image_urls.append({'url': image_url, 'eye_label': eye_label.lower()})
 
-    if right_file:
-        right_filename = secure_filename(right_file.filename)
-        right_filepath = os.path.join(app.config['UPLOAD_FOLDER'], right_filename)
-        right_file.save(right_filepath)
-    else:
-        right_filepath = None
+        # Open and preprocess the image
+        try:
+            image = Image.open(filepath).convert('RGB')
+            image = transform(image)
+            images[eye_label.lower()] = image
+        except Exception as e:
+            return jsonify({"error": f"Error processing image '{filename}': {e}"}), 400
 
-    # Open and preprocess the images
-    try:
-        images = []
-        if left_file:
-            left_image = Image.open(left_filepath).convert('RGB')
-            left_image = transform(left_image)
-            images.append(left_image)
-        if right_file:
-            right_image = Image.open(right_filepath).convert('RGB')
-            right_image = transform(right_image)
-            images.append(right_image)
-    except Exception as e:
-        return jsonify({"error": f"Error processing images: {e}"}), 400
 
-    # Determine which model to use based on the number of images
-    if len(images) == 2:
-        # Use the two-image model
-        combined_image = torch.stack(images).mean(dim=0)
-        combined_image = combined_image.unsqueeze(0)  # Add batch dimension
-
-        # Predict diseases using the two-image model
+    # Check if images are fundus images
+    non_fundus_images = []
+    for eye_label, image in images.items():
+        image_tensor = image.unsqueeze(0)  # Add batch dimension
         with torch.no_grad():
-            outputs = two_image_model(combined_image)
-            preds = torch.sigmoid(outputs).squeeze(0)  # Shape: (num_classes,)
+            outputs = fundus_detector(image_tensor)
+            _, preds = torch.max(outputs, 1)
+        if preds.item() == 1:  # Assuming class 1 is 'fundus', class 0 is 'non-fundus'
+            non_fundus_images.append(eye_label)
 
-    elif len(images) == 1:
-        # Use the single-image model
-        single_image = images[0].unsqueeze(0)  # Add batch dimension
+    if non_fundus_images:
+        # If any images are not fundus images, return an error message
+        non_fundus_eyes = ' and '.join(non_fundus_images)
+        return jsonify({"error": f"The uploaded image(s) for {non_fundus_eyes} eye(s) are not fundus images. EyeGPT can only analyze fundus images."}), 400
+
+    # Initialize dictionaries to hold predictions
+    predicted_diseases = {}
+    treatment_texts = {}
+    diagram_urls = {}
+
+    # Threshold for predictions
+    threshold = 0.5
+    disease_indices = list(range(1, len(class_to_disease)))  # indices 1-7
+
+    # Predict diseases for each eye
+    for eye_label in images:
+        image_tensor = images[eye_label].unsqueeze(0)  # Add batch dimension
 
         # Predict diseases using the single-image model
         with torch.no_grad():
-            outputs = single_image_model(single_image)
+            outputs = single_image_model(image_tensor)
             preds = torch.sigmoid(outputs).squeeze(0)  # Shape: (num_classes,)
 
-    else:
-        return jsonify({"error": "No valid images provided."}), 400
+        # Apply threshold to predictions
+        pred_disease_indices = (preds[disease_indices] > threshold).nonzero(as_tuple=True)[0].tolist()
+        pred_disease_indices = [i+1 for i in pred_disease_indices]  # Adjust indices back to original
 
-    # Apply threshold to predictions
-    threshold = 0.5
+        normal_pred = preds[0] > threshold
 
-    # Get indices of predicted disease classes (excluding 'Normal' class)
-    disease_indices = list(range(1, len(class_to_disease)))  # indices 1-7
-    predicted_disease_indices = (preds[disease_indices] > threshold).nonzero(as_tuple=True)[0].tolist()
-    predicted_disease_indices = [i+1 for i in predicted_disease_indices]  # Adjust indices back to original
+        if pred_disease_indices:
+            diseases = [class_to_disease[idx] for idx in pred_disease_indices]
+            treatments = [disease_treatment.get(disease, 'No treatment available') for disease in diseases]
+        elif normal_pred:
+            diseases = ['Normal']
+            treatments = [disease_treatment.get('Normal', 'Maintain regular eye check-ups and a healthy lifestyle.')]
+        else:
+            diseases = []
+            treatments = ['No specific treatment required. Maintain regular eye check-ups and a healthy lifestyle.']
 
-    # Check if 'Normal' is predicted
-    normal_pred = preds[0] > threshold
+        predicted_diseases[eye_label] = diseases
+        treatment_texts[eye_label] = treatments
 
-    if predicted_disease_indices:
-        predicted_diseases = [class_to_disease[idx] for idx in predicted_disease_indices]
-        treatment_texts = [disease_treatment.get(disease, 'No treatment available') for disease in predicted_diseases]
-    elif normal_pred:
-        predicted_diseases = ['Normal']
-        treatment_texts = [disease_treatment.get('Normal', 'Maintain regular eye check-ups and a healthy lifestyle.')]
-    else:
-        # Neither 'Normal' nor any diseases are predicted above threshold
-        predicted_diseases = []
-        treatment_texts = ['No specific treatment required. Maintain regular eye check-ups and a healthy lifestyle.']
+        # Get diagram URLs for diagnosed diseases
+        diagrams = []
+        for disease in diseases:
+            diagram_filename = disease_diagram.get(disease)
+            if diagram_filename:
+                diagram_url = url_for('static', filename=f'diagrams/{diagram_filename}', _external=True)
+                diagrams.append(diagram_url)
+        diagram_urls[eye_label] = diagrams
 
-    # Generate LLM response
-    diagnosis_text = ', '.join(predicted_diseases) if predicted_diseases else 'No detectable diseases'
-    treatment_text = '\n'.join(treatment_texts)
 
-    # Get diagram URLs for diagnosed diseases
-    diagram_urls = []
-    for disease in predicted_diseases:
-        diagram_filename = disease_diagram.get(disease)
-        if diagram_filename:
-            diagram_url = url_for('static', filename=f'diagrams/{diagram_filename}', _external=True)
-            diagram_urls.append(diagram_url)
+    # After getting the diagnosis, update the chat history
 
-    # Update chat history
-    session['chat_history'] = session.get('chat_history', [])
-    user_message = f"Uploaded images diagnosed with: {diagnosis_text}"
-    session['chat_history'].append({'role': 'user', 'content': user_message})
+    # Prepare the diagnosis text
+    diagnosis_text = ""
+    for eye_label in ['left', 'right']:
+        if eye_label in predicted_diseases:
+            diseases = predicted_diseases[eye_label]
+            diagnosis = ', '.join(diseases) if diseases else 'No detectable diseases'
+            diagnosis_text += f"{eye_label.capitalize()} Eye: {diagnosis}\n"
 
-    # Get the LLM response with chat history
-    llm_response = get_llm_response(predicted_diseases, treatment_texts, chat_history=session['chat_history'], is_image_upload=True)
+    # Save the user's message with images
+    user_message = f"Uploaded images diagnosed with:\n{diagnosis_text}"
+    new_message = Message(
+        role='user',
+        content=message_text if message_text else user_message,
+        chat_id=chat.id,
+        images=json.dumps(image_urls)  # Serialize image URLs
+    )
+    db.session.add(new_message)
 
-    # Append the LLM response to the chat history
-    session['chat_history'].append({'role': 'assistant', 'content': llm_response})
+    # Prepare left and right diseases, using None if the eye was not uploaded
+    left_diseases = predicted_diseases.get('left', None)
+    right_diseases = predicted_diseases.get('right', None)
 
-    # Include diagram URLs in the response
-    return jsonify({
+    # Retrieve the last 5 messages for context
+    messages = Message.query.filter_by(chat_id=chat.id).order_by(Message.id).all()
+    chat_history = [{'role': msg.role, 'content': msg.content} for msg in messages][-5:]
+
+    # Get the LLM response
+    llm_response = get_llm_response(
+        left_diseases=left_diseases,
+        right_diseases=right_diseases,
+        chat_history=chat_history,
+        is_image_upload=True
+    )
+
+    # Collect all diagram URLs into a single list
+    all_diagram_urls = []
+    for eye_label in ['left', 'right']:
+        all_diagram_urls.extend(diagram_urls.get(eye_label, []))
+
+    # Save the assistant's response with the combined diagrams
+    assistant_message = Message(
+        role='assistant',
+        content=llm_response,
+        chat_id=chat.id,
+        diagrams=json.dumps(all_diagram_urls)  # Serialize list of diagram URLs
+    )
+    db.session.add(assistant_message)
+    db.session.commit()
+
+    # Include image URLs and diagram URLs in the response
+    response_data = {
         "diagnosis": llm_response,
-        "chat_history": session['chat_history'],
-        "diagrams": diagram_urls
-    })
+        "image_urls": image_urls,
+        "diagram_urls": [],
+    }
+
+    # Collect diagram URLs from left and right eyes
+    for eye_label in ['left', 'right']:
+        if eye_label in predicted_diseases:
+            response_data[f'{eye_label}_eye'] = {
+                "diagnosis": ', '.join(predicted_diseases[eye_label]) if predicted_diseases[eye_label] else 'No detectable diseases',
+                "diagrams": diagram_urls.get(eye_label, [])
+            }
+            response_data['diagram_urls'].extend(diagram_urls.get(eye_label, []))
+
+    return jsonify(response_data)
 
 if __name__ == '__main__':
     app.run(debug=True)
